@@ -11,11 +11,17 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tar::Archive;
 use tauri::{AppHandle, Emitter, Manager};
+
+/// Default number of parallel download chunks.
+const DEFAULT_CHUNK_COUNT: usize = 4;
+/// Minimum size per chunk (10 MB). Files smaller than 2× this value are
+/// downloaded in a single stream to avoid the overhead of splitting.
+const MIN_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub enum EngineType {
@@ -749,7 +755,9 @@ impl ModelManager {
                 if partial_path.exists() {
                     model.partial_size = partial_path.metadata().map(|m| m.len()).unwrap_or(0);
                 } else {
-                    model.partial_size = 0;
+                    // Also account for multi-part chunk files (.partN)
+                    let part_size = Self::part_files_total_size(&self.models_dir, &model.filename);
+                    model.partial_size = part_size;
                 }
             } else {
                 // For file-based models (existing logic)
@@ -763,7 +771,9 @@ impl ModelManager {
                 if partial_path.exists() {
                     model.partial_size = partial_path.metadata().map(|m| m.len()).unwrap_or(0);
                 } else {
-                    model.partial_size = 0;
+                    // Also account for multi-part chunk files (.partN)
+                    let part_size = Self::part_files_total_size(&self.models_dir, &model.filename);
+                    model.partial_size = part_size;
                 }
             }
         }
@@ -984,6 +994,128 @@ impl ModelManager {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
+    /// Split a total file size into byte ranges for parallel downloading.
+    /// Each range is an inclusive `(start, end)` pair.
+    fn calculate_chunks(total_size: u64, max_chunks: usize) -> Vec<(u64, u64)> {
+        let chunk_count = if total_size / max_chunks as u64 > MIN_CHUNK_SIZE {
+            max_chunks
+        } else {
+            // Small files → fewer chunks
+            std::cmp::max(1, (total_size / MIN_CHUNK_SIZE) as usize)
+        };
+
+        let chunk_size = total_size / chunk_count as u64;
+        let mut chunks = Vec::new();
+        for i in 0..chunk_count {
+            let start = i as u64 * chunk_size;
+            let end = if i == chunk_count - 1 {
+                total_size - 1
+            } else {
+                (i as u64 + 1) * chunk_size - 1
+            };
+            chunks.push((start, end));
+        }
+        chunks
+    }
+
+    /// Download a single byte-range chunk to its part file, supporting resume.
+    async fn download_chunk(
+        client: &reqwest::Client,
+        url: &str,
+        start: u64,
+        end: u64,
+        partial_path: &Path,
+        progress: &AtomicU64,
+        cancel_flag: &AtomicBool,
+    ) -> Result<()> {
+        // Resume from existing part file size
+        let resume_from = if partial_path.exists() {
+            partial_path.metadata()?.len()
+        } else {
+            0
+        };
+
+        let actual_start = start + resume_from;
+        if actual_start > end {
+            // This chunk was already fully downloaded
+            return Ok(());
+        }
+
+        let response = client
+            .get(url)
+            .header("Range", format!("bytes={}-{}", actual_start, end))
+            .send()
+            .await?;
+
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(anyhow::anyhow!(
+                "Server returned {} for range request (expected 206)",
+                response.status()
+            ));
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(partial_path)?;
+
+        let mut stream = response.bytes_stream();
+        while let Some(data) = stream.next().await {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Ok(()); // Cancelled — part files are kept for resume
+            }
+            let bytes = data?;
+            file.write_all(&bytes)?;
+            progress.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Concatenate part files into a single output file and remove the parts.
+    fn merge_chunks(part_paths: &[PathBuf], output_path: &Path) -> Result<()> {
+        let mut output = std::fs::File::create(output_path)?;
+        let mut buffer = vec![0u8; 1024 * 1024]; // 1 MB buffer for large file merges
+        for part in part_paths {
+            let mut input = std::fs::File::open(part)?;
+            loop {
+                let n = input.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..n])?;
+            }
+        }
+        output.flush()?;
+
+        // Clean up part files
+        for part in part_paths {
+            let _ = fs::remove_file(part);
+        }
+        Ok(())
+    }
+
+    /// Remove any leftover `.partN` files for a given model filename.
+    fn cleanup_part_files(models_dir: &Path, filename: &str) {
+        for i in 0..DEFAULT_CHUNK_COUNT {
+            let p = models_dir.join(format!("{}.part{}", filename, i));
+            if p.exists() {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+
+    /// Sum the sizes of any existing `.partN` files for a given model filename.
+    fn part_files_total_size(models_dir: &Path, filename: &str) -> u64 {
+        let mut total = 0u64;
+        for i in 0..DEFAULT_CHUNK_COUNT {
+            let p = models_dir.join(format!("{}.part{}", filename, i));
+            if p.exists() {
+                total += p.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        total
+    }
+
     pub async fn download_model(&self, model_id: &str) -> Result<()> {
         let model_info = {
             let models = self.available_models.lock().unwrap();
@@ -1003,23 +1135,14 @@ impl ModelManager {
 
         // Don't download if complete version already exists
         if model_path.exists() {
-            // Clean up any partial file that might exist
+            // Clean up any partial / part files that might exist
             if partial_path.exists() {
                 let _ = fs::remove_file(&partial_path);
             }
+            Self::cleanup_part_files(&self.models_dir, &model_info.filename);
             self.update_download_status()?;
             return Ok(());
         }
-
-        // Check if we have a partial download to resume
-        let mut resume_from = if partial_path.exists() {
-            let size = partial_path.metadata()?.len();
-            info!("Resuming download of model {} from byte {}", model_id, size);
-            size
-        } else {
-            info!("Starting fresh download of model {} from {}", model_id, url);
-            0
-        };
 
         // Mark as downloading
         {
@@ -1045,149 +1168,303 @@ impl ModelManager {
             disarmed: false,
         };
 
-        // Create HTTP client with range request for resuming
+        // ── Probe server for Content-Length and Range support ──────────────
         let client = reqwest::Client::new();
-        let mut request = client.get(&url);
+        let head_resp = client.head(&url).send().await?;
+        let total_size = head_resp.content_length().unwrap_or(0);
+        let supports_range = head_resp
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "bytes")
+            .unwrap_or(false);
 
-        if resume_from > 0 {
-            request = request.header("Range", format!("bytes={}-", resume_from));
-        }
+        // Use multi-part only when the server supports Range AND the file is
+        // large enough to benefit from splitting.
+        let use_multipart = supports_range && total_size >= MIN_CHUNK_SIZE * 2;
 
-        let mut response = request.send().await?;
-
-        // If we tried to resume but server returned 200 (not 206 Partial Content),
-        // the server doesn't support range requests. Delete partial file and restart
-        // fresh to avoid file corruption (appending full file to partial).
-        if resume_from > 0 && response.status() == reqwest::StatusCode::OK {
-            warn!(
-                "Server doesn't support range requests for model {}, restarting download",
-                model_id
+        if use_multipart {
+            info!(
+                "Using multi-part download ({} chunks) for model {} ({} bytes)",
+                DEFAULT_CHUNK_COUNT, model_id, total_size
             );
-            drop(response);
-            let _ = fs::remove_file(&partial_path);
 
-            // Reset resume_from since we're starting fresh
-            resume_from = 0;
+            let ranges = Self::calculate_chunks(total_size, DEFAULT_CHUNK_COUNT);
+            let part_paths: Vec<PathBuf> = ranges
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    self.models_dir
+                        .join(format!("{}.part{}", &model_info.filename, i))
+                })
+                .collect();
 
-            // Restart download without range header
-            response = client.get(&url).send().await?;
-        }
+            // Shared atomic progress counter across all tasks
+            let total_progress = Arc::new(AtomicU64::new(0));
+            // Count bytes already present in existing part files (resume).
+            // Note: individual part integrity is not verified here; the final
+            // SHA256 check after merge will catch any corruption.
+            for (i, &(start, end)) in ranges.iter().enumerate() {
+                if part_paths[i].exists() {
+                    let existing = part_paths[i].metadata().map(|m| m.len()).unwrap_or(0);
+                    let chunk_size = end - start + 1;
+                    let clamped = std::cmp::min(existing, chunk_size);
+                    total_progress.fetch_add(clamped, Ordering::Relaxed);
+                }
+            }
 
-        // Check for success or partial content status
-        if !response.status().is_success()
-            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
-        {
-            return Err(anyhow::anyhow!(
-                "Failed to download model: HTTP {}",
-                response.status()
-            ));
-        }
+            // Emit initial progress
+            let initial_downloaded = total_progress.load(Ordering::Relaxed);
+            let _ = self.app_handle.emit(
+                "model-download-progress",
+                &DownloadProgress {
+                    model_id: model_id.to_string(),
+                    downloaded: initial_downloaded,
+                    total: total_size,
+                    percentage: if total_size > 0 {
+                        (initial_downloaded as f64 / total_size as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                },
+            );
 
-        let total_size = if resume_from > 0 {
-            // For resumed downloads, add the resume point to content length
-            resume_from + response.content_length().unwrap_or(0)
-        } else {
-            response.content_length().unwrap_or(0)
-        };
+            // Spawn a chunk download task per range
+            let mut handles = Vec::new();
+            for (i, &(start, end)) in ranges.iter().enumerate() {
+                let client = client.clone();
+                let url = url.clone();
+                let part_path = part_paths[i].clone();
+                let progress = total_progress.clone();
+                let cancel = cancel_flag.clone();
 
-        let mut downloaded = resume_from;
-        let mut stream = response.bytes_stream();
+                handles.push(tokio::spawn(async move {
+                    Self::download_chunk(&client, &url, start, end, &part_path, &progress, &cancel)
+                        .await
+                }));
+            }
 
-        // Open file for appending if resuming, or create new if starting fresh
-        let mut file = if resume_from > 0 {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&partial_path)?
-        } else {
-            std::fs::File::create(&partial_path)?
-        };
+            // Progress reporter: emit throttled progress while tasks are running
+            let progress_model_id = model_id.to_string();
+            let progress_handle = self.app_handle.clone();
+            let progress_counter = total_progress.clone();
+            let progress_cancel = cancel_flag.clone();
+            let progress_reporter = tokio::spawn(async move {
+                let throttle = Duration::from_millis(100);
+                loop {
+                    tokio::time::sleep(throttle).await;
+                    if progress_cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let downloaded = progress_counter.load(Ordering::Relaxed);
+                    let _ = progress_handle.emit(
+                        "model-download-progress",
+                        &DownloadProgress {
+                            model_id: progress_model_id.clone(),
+                            downloaded,
+                            total: total_size,
+                            percentage: if total_size > 0 {
+                                (downloaded as f64 / total_size as f64) * 100.0
+                            } else {
+                                0.0
+                            },
+                        },
+                    );
+                    if downloaded >= total_size {
+                        break;
+                    }
+                }
+            });
 
-        // Emit initial progress
-        let initial_progress = DownloadProgress {
-            model_id: model_id.to_string(),
-            downloaded,
-            total: total_size,
-            percentage: if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                0.0
-            },
-        };
-        let _ = self
-            .app_handle
-            .emit("model-download-progress", &initial_progress);
+            // Wait for all chunk tasks
+            let mut chunk_errors = Vec::new();
+            for handle in handles {
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        // Signal remaining chunks to stop on first error
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        chunk_errors.push(e);
+                    }
+                    Err(e) => {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        chunk_errors.push(anyhow::anyhow!("Chunk task panicked: {}", e));
+                    }
+                }
+            }
+            progress_reporter.abort();
 
-        // Throttle progress events to max 10/sec (100ms intervals)
-        let mut last_emit = Instant::now();
-        let throttle_duration = Duration::from_millis(100);
-
-        // Download with progress
-        while let Some(chunk) = stream.next().await {
-            // Check if download was cancelled
-            if cancel_flag.load(Ordering::Relaxed) {
-                drop(file);
+            // If user-cancelled, keep part files for resume
+            if chunk_errors.is_empty() && cancel_flag.load(Ordering::Relaxed) {
                 info!("Download cancelled for: {}", model_id);
-                // Keep partial file for resume functionality.
-                // Guard handles is_downloading + cancel_flags cleanup on drop.
                 return Ok(());
             }
 
-            let chunk = chunk?;
-
-            file.write_all(&chunk)?;
-            downloaded += chunk.len() as u64;
-
-            let percentage = if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            // Emit progress event (throttled to avoid UI freeze)
-            if last_emit.elapsed() >= throttle_duration {
-                let progress = DownloadProgress {
-                    model_id: model_id.to_string(),
-                    downloaded,
-                    total: total_size,
-                    percentage,
-                };
-                let _ = self.app_handle.emit("model-download-progress", &progress);
-                last_emit = Instant::now();
-            }
-        }
-
-        // Emit final progress to ensure 100% is shown
-        let final_progress = DownloadProgress {
-            model_id: model_id.to_string(),
-            downloaded,
-            total: total_size,
-            percentage: if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                100.0
-            },
-        };
-        let _ = self
-            .app_handle
-            .emit("model-download-progress", &final_progress);
-
-        file.flush()?;
-        drop(file); // Ensure file is closed before moving
-
-        // Verify downloaded file size matches expected size
-        if total_size > 0 {
-            let actual_size = partial_path.metadata()?.len();
-            if actual_size != total_size {
-                // Download is incomplete/corrupted - delete partial and return error
-                let _ = fs::remove_file(&partial_path);
+            if !chunk_errors.is_empty() {
+                let msgs: Vec<String> = chunk_errors.iter().map(|e| e.to_string()).collect();
                 return Err(anyhow::anyhow!(
-                    "Download incomplete: expected {} bytes, got {} bytes",
-                    total_size,
-                    actual_size
+                    "Multi-part download failed: {}",
+                    msgs.join("; ")
                 ));
             }
+
+            // Emit 100% progress
+            let _ = self.app_handle.emit(
+                "model-download-progress",
+                &DownloadProgress {
+                    model_id: model_id.to_string(),
+                    downloaded: total_size,
+                    total: total_size,
+                    percentage: 100.0,
+                },
+            );
+
+            // Merge part files into the partial file
+            info!("Merging {} chunks for model {}", part_paths.len(), model_id);
+            Self::merge_chunks(&part_paths, &partial_path)?;
+        } else {
+            // ── Single-stream download (original behaviour) ───────────────
+            info!(
+                "Using single-stream download for model {} ({} bytes)",
+                model_id, total_size
+            );
+
+            // Check if we have a partial download to resume
+            let mut resume_from = if partial_path.exists() {
+                let size = partial_path.metadata()?.len();
+                info!("Resuming download of model {} from byte {}", model_id, size);
+                size
+            } else {
+                info!("Starting fresh download of model {} from {}", model_id, url);
+                0
+            };
+
+            let mut request = client.get(&url);
+            if resume_from > 0 {
+                request = request.header("Range", format!("bytes={}-", resume_from));
+            }
+
+            let mut response = request.send().await?;
+
+            // If we tried to resume but server returned 200 (not 206 Partial Content),
+            // the server doesn't support range requests. Delete partial file and restart
+            // fresh to avoid file corruption (appending full file to partial).
+            if resume_from > 0 && response.status() == reqwest::StatusCode::OK {
+                warn!(
+                    "Server doesn't support range requests for model {}, restarting download",
+                    model_id
+                );
+                drop(response);
+                let _ = fs::remove_file(&partial_path);
+                resume_from = 0;
+                response = client.get(&url).send().await?;
+            }
+
+            if !response.status().is_success()
+                && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+            {
+                return Err(anyhow::anyhow!(
+                    "Failed to download model: HTTP {}",
+                    response.status()
+                ));
+            }
+
+            let single_total = if resume_from > 0 {
+                resume_from + response.content_length().unwrap_or(0)
+            } else {
+                response.content_length().unwrap_or(0)
+            };
+
+            let mut downloaded = resume_from;
+            let mut stream = response.bytes_stream();
+
+            let mut file = if resume_from > 0 {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&partial_path)?
+            } else {
+                std::fs::File::create(&partial_path)?
+            };
+
+            let _ = self.app_handle.emit(
+                "model-download-progress",
+                &DownloadProgress {
+                    model_id: model_id.to_string(),
+                    downloaded,
+                    total: single_total,
+                    percentage: if single_total > 0 {
+                        (downloaded as f64 / single_total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                },
+            );
+
+            let mut last_emit = Instant::now();
+            let throttle_duration = Duration::from_millis(100);
+
+            while let Some(chunk) = stream.next().await {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    drop(file);
+                    info!("Download cancelled for: {}", model_id);
+                    return Ok(());
+                }
+
+                let chunk = chunk?;
+                file.write_all(&chunk)?;
+                downloaded += chunk.len() as u64;
+
+                let percentage = if single_total > 0 {
+                    (downloaded as f64 / single_total as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                if last_emit.elapsed() >= throttle_duration {
+                    let progress = DownloadProgress {
+                        model_id: model_id.to_string(),
+                        downloaded,
+                        total: single_total,
+                        percentage,
+                    };
+                    let _ = self.app_handle.emit("model-download-progress", &progress);
+                    last_emit = Instant::now();
+                }
+            }
+
+            let _ = self.app_handle.emit(
+                "model-download-progress",
+                &DownloadProgress {
+                    model_id: model_id.to_string(),
+                    downloaded,
+                    total: single_total,
+                    percentage: if single_total > 0 {
+                        (downloaded as f64 / single_total as f64) * 100.0
+                    } else {
+                        100.0
+                    },
+                },
+            );
+
+            file.flush()?;
+            drop(file);
+
+            // Verify downloaded file size matches expected size
+            if single_total > 0 {
+                let actual_size = partial_path.metadata()?.len();
+                if actual_size != single_total {
+                    let _ = fs::remove_file(&partial_path);
+                    return Err(anyhow::anyhow!(
+                        "Download incomplete: expected {} bytes, got {} bytes",
+                        single_total,
+                        actual_size
+                    ));
+                }
+            }
         }
+
+        // ── Post-download: verification & extraction (shared path) ────────
 
         // Verify SHA256 checksum. Runs in a blocking thread so the async executor is not
         // stalled while hashing large model files (up to 1.6 GB). On failure the partial
@@ -1370,6 +1647,18 @@ impl ModelManager {
             fs::remove_file(&partial_path)?;
             info!("Partial file deleted successfully");
             deleted_something = true;
+        }
+
+        // Delete any leftover multi-part chunk files (.partN)
+        for i in 0..DEFAULT_CHUNK_COUNT {
+            let part_path = self
+                .models_dir
+                .join(format!("{}.part{}", &model_info.filename, i));
+            if part_path.exists() {
+                info!("Deleting part file at: {:?}", part_path);
+                let _ = fs::remove_file(&part_path);
+                deleted_something = true;
+            }
         }
 
         if !deleted_something {
@@ -1645,5 +1934,78 @@ mod tests {
             ModelManager::verify_sha256(&missing_path, Some("anyexpectedhash"), "missing_model");
 
         assert!(result.is_err(), "missing file must return an error");
+    }
+
+    // ── calculate_chunks tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_calculate_chunks_large_file() {
+        // 1.6 GB → should produce DEFAULT_CHUNK_COUNT chunks
+        let total = 1_600_000_000u64;
+        let chunks = ModelManager::calculate_chunks(total, 4);
+        assert_eq!(chunks.len(), 4);
+        // First chunk starts at 0
+        assert_eq!(chunks[0].0, 0);
+        // Last chunk ends at total - 1
+        assert_eq!(chunks[3].1, total - 1);
+        // Chunks are contiguous (no gaps / overlaps)
+        for w in chunks.windows(2) {
+            assert_eq!(w[0].1 + 1, w[1].0);
+        }
+    }
+
+    #[test]
+    fn test_calculate_chunks_small_file_single() {
+        // 5 MB → smaller than MIN_CHUNK_SIZE → should produce 1 chunk
+        let total = 5 * 1024 * 1024;
+        let chunks = ModelManager::calculate_chunks(total, 4);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], (0, total - 1));
+    }
+
+    #[test]
+    fn test_calculate_chunks_covers_entire_file() {
+        let total = 100 * 1024 * 1024; // 100 MB
+        let chunks = ModelManager::calculate_chunks(total, 4);
+        // Sum of chunk sizes must equal total
+        let sum: u64 = chunks.iter().map(|(s, e)| e - s + 1).sum();
+        assert_eq!(sum, total);
+    }
+
+    #[test]
+    fn test_calculate_chunks_medium_file() {
+        // 25 MB → should produce 2 chunks (25 / 10 = 2)
+        let total = 25 * 1024 * 1024;
+        let chunks = ModelManager::calculate_chunks(total, 4);
+        assert_eq!(chunks.len(), 2);
+        let sum: u64 = chunks.iter().map(|(s, e)| e - s + 1).sum();
+        assert_eq!(sum, total);
+    }
+
+    // ── merge_chunks test ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_merge_chunks() {
+        let dir = TempDir::new().unwrap();
+        let part0 = dir.path().join("model.bin.part0");
+        let part1 = dir.path().join("model.bin.part1");
+        let output = dir.path().join("model.bin.partial");
+
+        File::create(&part0).unwrap().write_all(b"AAAA").unwrap();
+        File::create(&part1).unwrap().write_all(b"BBBB").unwrap();
+
+        let parts = vec![part0.clone(), part1.clone()];
+        ModelManager::merge_chunks(&parts, &output).unwrap();
+
+        let mut content = Vec::new();
+        File::open(&output)
+            .unwrap()
+            .read_to_end(&mut content)
+            .unwrap();
+        assert_eq!(content, b"AAAABBBB");
+
+        // Part files should be deleted
+        assert!(!part0.exists());
+        assert!(!part1.exists());
     }
 }
