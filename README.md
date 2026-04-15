@@ -2,6 +2,24 @@
 
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)
 
+## 🔀 Fork Changes
+
+This is a fork of [cjpais/Handy](https://github.com/cjpais/Handy) with a **Multi-Part Parallel Download System** for model files, significantly improving download speed and reliability.
+
+### Key Improvements
+
+- **Parallel chunked downloading** — large model files (>20 MB) are split across 4 concurrent HTTP streams
+- **Per-chunk resume** — if a download is interrupted, each chunk (`.partN`) resumes from where it left off
+- **Automatic server capability detection** — a `HEAD` request checks `Accept-Ranges` and `Content-Length` before choosing a strategy
+- **Graceful fallback** — servers without `Range` support or files under 20 MB use a single-stream download
+- **Atomic merge** — chunk files are merged into the final model file only after all chunks complete successfully
+- **Cleanup** — `.partN` files are removed on successful download or when a model is deleted
+- **Comprehensive tests** — unit tests for `calculate_chunks` (splitting, coverage, edge cases) and `merge_chunks` (concatenation and cleanup)
+
+👉 [Compare with upstream](https://github.com/cjpais/Handy/compare/main...IdHossein:Handy:main)
+
+---
+
 **A free, open source, and extensible speech-to-text application that works completely offline.**
 
 Handy is a cross-platform desktop application that provides simple, privacy-focused speech transcription. Press a shortcut, speak, and have your words appear in any text field. This happens on your own computer without sending any information to the cloud.
