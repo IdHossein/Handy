@@ -1074,7 +1074,7 @@ impl ModelManager {
     /// Concatenate part files into a single output file and remove the parts.
     fn merge_chunks(part_paths: &[PathBuf], output_path: &Path) -> Result<()> {
         let mut output = std::fs::File::create(output_path)?;
-        let mut buffer = [0u8; 65536];
+        let mut buffer = vec![0u8; 1024 * 1024]; // 1 MB buffer for large file merges
         for part in part_paths {
             let mut input = std::fs::File::open(part)?;
             loop {
@@ -1201,7 +1201,9 @@ impl ModelManager {
 
             // Shared atomic progress counter across all tasks
             let total_progress = Arc::new(AtomicU64::new(0));
-            // Count bytes already present in existing part files (resume)
+            // Count bytes already present in existing part files (resume).
+            // Note: individual part integrity is not verified here; the final
+            // SHA256 check after merge will catch any corruption.
             for (i, &(start, end)) in ranges.iter().enumerate() {
                 if part_paths[i].exists() {
                     let existing = part_paths[i].metadata().map(|m| m.len()).unwrap_or(0);
@@ -1279,14 +1281,21 @@ impl ModelManager {
             for handle in handles {
                 match handle.await {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => chunk_errors.push(e),
-                    Err(e) => chunk_errors.push(anyhow::anyhow!("Chunk task panicked: {}", e)),
+                    Ok(Err(e)) => {
+                        // Signal remaining chunks to stop on first error
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        chunk_errors.push(e);
+                    }
+                    Err(e) => {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        chunk_errors.push(anyhow::anyhow!("Chunk task panicked: {}", e));
+                    }
                 }
             }
             progress_reporter.abort();
 
-            // If cancelled, keep part files for resume
-            if cancel_flag.load(Ordering::Relaxed) {
+            // If user-cancelled, keep part files for resume
+            if chunk_errors.is_empty() && cancel_flag.load(Ordering::Relaxed) {
                 info!("Download cancelled for: {}", model_id);
                 return Ok(());
             }
